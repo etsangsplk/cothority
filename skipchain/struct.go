@@ -887,7 +887,11 @@ func (db *SkipBlockDB) getFromTx(tx *bolt.Tx, sbID SkipBlockID) (*SkipBlock, err
 		return nil, nil
 	}
 
-	_, sbMsg, err := network.Unmarshal(val, cothority.Suite)
+	// For some reason boltdb changes the val before Unmarshal finishes. When
+	// copying the value into a buffer, there is no SIGSEGV anymore.
+	buf := make([]byte, len(val))
+	copy(buf, val)
+	_, sbMsg, err := network.Unmarshal(buf, cothority.Suite)
 	if err != nil {
 		return nil, err
 	}

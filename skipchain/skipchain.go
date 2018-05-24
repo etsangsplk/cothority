@@ -207,7 +207,7 @@ func (s *Service) StoreSkipBlock(psbd *StoreSkipBlock) (*StoreSkipBlockReply, er
 	} else {
 
 		// We're appending a block to an existing chain.
-		log.Lvlf2("Adding block with roster %+v to %x",
+		log.Lvlf2("Preparing to add block with roster %+v to %x",
 			psbd.NewBlock.Roster.List, psbd.TargetSkipChainID)
 
 		// Check if we really want to take this block with regard to our
@@ -343,16 +343,12 @@ func (s *Service) StoreSkipBlock(psbd *StoreSkipBlock) (*StoreSkipBlockReply, er
 					"Didn't get skipblock in back-link")
 
 			}
-			if err := s.forwardLink(
-				&ForwardSignature{
-					TargetHeight: i + 1,
-					Previous:     back.Hash,
-					Newest:       prop,
-				}); err != nil {
-				// This is not a critical failure - we have at least
-				// one forward-link
-				log.Lvl1("Couldn't get old block to sign: " + err.Error())
-			}
+			// Requesting creation of secondary forward link.
+			s.SendRaw(back.Roster.List[0], &ForwardSignature{
+				TargetHeight: i + 1,
+				Previous:     back.Hash,
+				Newest:       prop.Copy(),
+			})
 		}
 	}
 	reply := &StoreSkipBlockReply{
@@ -966,50 +962,61 @@ func (s *Service) bftForwardLinkLevel0Ack(msg []byte, data []byte) bool {
 
 // forwardLink receives a signature request of a newly accepted block.
 // It only needs the 2nd-newest block and the forward-link.
-func (s *Service) forwardLink(fs *ForwardSignature) error {
-	if fs.TargetHeight >= len(fs.Newest.BackLinkIDs) {
-		return errors.New("This backlink-height doesn't exist")
-	}
-	from := s.db.GetByID(fs.Newest.BackLinkIDs[fs.TargetHeight])
-	if from == nil {
-		return errors.New("Didn't find target-block")
-	}
-	if !fs.Previous.Equal(from.Hash) {
-		return errors.New("TargetHeight backlink doesn't correspond to previous")
-	}
-	// Add links to prove the newest block is valid.
-	pointer := from
-	for !pointer.Hash.Equal(fs.Newest.Hash) {
-		highest := pointer.ForwardLink[len(pointer.ForwardLink)-1]
-		fs.Links = append(fs.Links, highest)
-		next := s.db.GetByID(highest.To)
-		if next == nil {
-			sbs, err := s.getBlocks(pointer.Roster, highest.To, 1)
-			if err != nil || len(sbs) == 0 {
-				return errors.New("cannot create proof that the blocks are linked: " + err.Error())
-			}
-			next = sbs[0]
+func (s *Service) forwardLink(req *network.Envelope) {
+	err := func() error {
+		fsOrig, ok := req.Msg.(*ForwardSignature)
+		if !ok {
+			return errors.New("didn't get ForwardSignature message")
 		}
-		pointer = next
-	}
-	data, err := network.Marshal(fs)
-	if err != nil {
-		return err
-	}
-	fl := NewForwardLink(from, fs.Newest)
-	sig, err := s.startBFT(bftFollowBlock, from.Roster, fl.Hash(), data)
-	if err != nil {
-		return errors.New("Couldn't get signature: " + err.Error())
-	}
-	log.Lvl1("Adding forward-link to", from.Index)
+		// We need to create a copy here if the message has been sent to ourselves.
+		fs := *fsOrig
+		if fs.TargetHeight >= len(fs.Newest.BackLinkIDs) {
+			return errors.New("This backlink-height doesn't exist")
+		}
+		from := s.db.GetByID(fs.Newest.BackLinkIDs[fs.TargetHeight])
+		if from == nil {
+			return errors.New("Didn't find target-block")
+		}
+		if !fs.Previous.Equal(from.Hash) {
+			return errors.New("TargetHeight backlink doesn't correspond to previous")
+		}
+		// Add links to prove the newest block is valid.
+		pointer := from
+		for !pointer.Hash.Equal(fs.Newest.Hash) {
+			highest := pointer.ForwardLink[len(pointer.ForwardLink)-1]
+			fs.Links = append(fs.Links, highest)
+			next := s.db.GetByID(highest.To)
+			if next == nil {
+				sbs, err := s.getBlocks(pointer.Roster, highest.To, 1)
+				if err != nil || len(sbs) == 0 {
+					return errors.New("cannot create proof that the blocks are linked: " + err.Error())
+				}
+				next = sbs[0]
+			}
+			pointer = next
+		}
+		data, err := network.Marshal(&fs)
+		if err != nil {
+			return err
+		}
+		fl := NewForwardLink(from, fs.Newest)
+		sig, err := s.startBFT(bftFollowBlock, from.Roster, fl.Hash(), data)
+		if err != nil {
+			return errors.New("Couldn't get signature: " + err.Error())
+		}
+		log.Lvl1("Adding forward-link to", from.Index)
 
-	fl.Signature = *sig
-	if !from.Roster.ID.Equal(fs.Newest.Roster.ID) {
-		fl.NewRoster = fs.Newest.Roster
+		fl.Signature = *sig
+		if !from.Roster.ID.Equal(fs.Newest.Roster.ID) {
+			fl.NewRoster = fs.Newest.Roster
+		}
+		from.AddForward(fl)
+		s.startPropagation([]*SkipBlock{from})
+		return nil
+	}()
+	if err != nil {
+		log.Error(s.ServerIdentity(), "couldn't create forwardLink:", err, "requested by", req.ServerIdentity)
 	}
-	from.AddForward(fl)
-	s.startPropagation([]*SkipBlock{from})
-	return nil
 }
 
 // verifyFollowBlock makes sure that a signature-request for a forward-link
@@ -1371,6 +1378,7 @@ func newSkipchainService(c *onet.Context) (onet.Service, error) {
 		s.CreateLinkPrivate, s.Unlink, s.AddFollow, s.ListFollow,
 		s.DelFollow, s.Listlink))
 	s.ServiceProcessor.RegisterStatusReporter("Skipblock", s.db)
+	s.RegisterProcessorFunc(network.RegisterMessage(&ForwardSignature{}), s.forwardLink)
 
 	if err := s.registerVerification(VerifyBase, s.verifyFuncBase); err != nil {
 		return nil, err

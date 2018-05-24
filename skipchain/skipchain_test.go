@@ -127,6 +127,18 @@ func storeSkipBlock(t *testing.T, nbrServers int, fail bool) {
 	assert.NotNil(t, psbr3.Latest)
 	latest3 := psbr3.Latest
 
+	// As the propagation of the last forward link might take some time, wait for
+	// it to be propagated by checking whether the updateChain has the new forward
+	// link included.
+	for {
+		gucr, err := service.GetUpdateChain(&GetUpdateChain{LatestID: genesis.Hash})
+		require.Nil(t, err)
+		if len(gucr.Update) == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	// verify creation of GenesisBlock:
 	blockCount++
 	assert.Equal(t, blockCount-1, latest3.Index)
@@ -1072,20 +1084,13 @@ func nukeBlocksFrom(t *testing.T, db *SkipBlockDB, where SkipBlockID) {
 }
 
 func TestRosterAddCausesSync(t *testing.T) {
-	if testing.Short() {
-		t.Skip("node failure tests do not run on travis, see #1000")
-	}
-
 	local := onet.NewLocalTest(cothority.Suite)
-	defer waitPropagationFinished(t, local)
 	defer local.CloseAll()
 	servers, _, genService := local.MakeSRS(cothority.Suite, 5, skipchainSID)
 	leader := genService.(*Service)
 
 	// put last one to sleep, wake it up after the others have added it into the roster
 	servers[4].Pause()
-	leader.bftTimeout = 100 * time.Millisecond
-	leader.propTimeout = 5 * leader.bftTimeout
 
 	log.Lvl1("Creating chain with 4 servers")
 	sbRoot := &SkipBlock{
@@ -1104,29 +1109,25 @@ func TestRosterAddCausesSync(t *testing.T) {
 	log.Lvl1("Add last server into roster")
 	newBlock := &SkipBlock{
 		SkipBlockFix: &SkipBlockFix{
-			MaximumHeight: 2,
-			BaseHeight:    3,
-			Roster:        local.GenRosterFromHost(servers...),
-			Data:          []byte{},
+			Roster: local.GenRosterFromHost(servers...),
+			Data:   []byte{},
 		},
 	}
 	ssbrep, err = leader.StoreSkipBlock(&StoreSkipBlock{
 		TargetSkipChainID: ssbrep.Latest.Hash,
 		NewBlock:          newBlock})
-	if err != nil {
-		t.Error(err)
-	}
+	require.Nil(t, err)
+	require.Nil(t, local.WaitDone(time.Second))
 
-	// Wake #4. It does not know any blocks yet.
+	// Wake up #4. It does not know any blocks yet.
 	log.Lvl1("Wake up last server")
 	servers[4].Unpause()
 
-	// Add a block on. #4 will be asked to sign a forward link on a block
-	// it has never heard of, so it will sync.
+	// Add a new block. #4 will be asked to sign a forward link on a block
+	// it has never heard of, so it will need to sync.
 	ssbrep, err = leader.StoreSkipBlock(&StoreSkipBlock{
 		TargetSkipChainID: ssbrep.Latest.Hash,
 		NewBlock:          newBlock})
-	if err != nil {
-		t.Error(err)
-	}
+	require.Nil(t, err)
+	log.Lvl1("Got block with servers[4]")
 }
